@@ -161,7 +161,7 @@ def fetch_finmind_q_data(stock_id):
     df_bs = _fetch("TaiwanStockBalanceSheet")
     return df_pl, df_bs
 
-# FinMind 季報還原器 (處理累計值問題與中英文對照)
+# FinMind 季報解析器 (中英文對照)
 def get_fm_series(df, keywords, is_pl=True):
     if df is None or df.empty: return pd.Series(dtype='float64')
     
@@ -177,19 +177,9 @@ def get_fm_series(df, keywords, is_pl=True):
         s = df[mask].drop_duplicates(subset=['date']).set_index('date')['value']
         s.index = pd.to_datetime(s.index)
         s = s.sort_index()
-        
-        # 損益表還原單季 (解決台灣財報的累計問題)
-        if is_pl:
-            s_single = s.copy()
-            for i in range(1, len(s)):
-                if s.index[i].year == s.index[i-1].year:
-                    q_diff = s.index[i].quarter - s.index[i-1].quarter
-                    if q_diff == 1: # 必須是連續兩季才能相減還原
-                        s_single.iloc[i] = s.iloc[i] - s.iloc[i-1]
-                    else:
-                        s_single.iloc[i] = np.nan
-            return s_single.dropna()
+        # FinMind 已經幫我們處理好單季數據了，直接回傳即可！
         return s
+        
     return pd.Series(dtype='float64')
 
 # -----------------------------------------------------------------------------
