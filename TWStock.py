@@ -143,41 +143,53 @@ def fetch_stock_data_yf(ticker):
 def fetch_finmind_q_data(stock_id):
     # 去除 YF 的 .TW 後綴
     pure_id = stock_id.replace('.TW', '').replace('.TWO', '')
-    url = "https://api.finmindtrade.com/api/v4/data"
     start_date = (pd.Timestamp.now() - pd.DateOffset(years=3)).strftime("%Y-%m-%d")
     
-    params = {
-        "dataset": "TaiwanStockFinancialStatements",
-        "data_id": pure_id,
-        "start_date": start_date
-    }
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if data.get('msg') == 'success' and data.get('data'):
-            return pd.DataFrame(data['data'])
-    except: pass
-    return pd.DataFrame()
+    def _fetch(dataset):
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {"dataset": dataset, "data_id": pure_id, "start_date": start_date}
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            data = r.json()
+            if data.get('msg') == 'success' and data.get('data'):
+                return pd.DataFrame(data['data'])
+        except: pass
+        return pd.DataFrame()
 
-# FinMind 季報還原器 (處理累計值問題)
+    # 同時獲取損益表與資產負債表
+    df_pl = _fetch("TaiwanStockFinancialStatements")
+    df_bs = _fetch("TaiwanStockBalanceSheet")
+    return df_pl, df_bs
+
+# FinMind 季報還原器 (處理累計值問題與中英文對照)
 def get_fm_series(df, keywords, is_pl=True):
-    if df.empty: return pd.Series(dtype='float64')
+    if df is None or df.empty: return pd.Series(dtype='float64')
+    
+    # 同時比對 type(英文) 與 origin_name(中文)
+    mask = pd.Series([False]*len(df), index=df.index)
     for kw in keywords:
-        mask = df['type'].str.contains(kw, na=False, regex=False)
-        if mask.any():
-            s = df[mask].drop_duplicates(subset=['date']).set_index('date')['value']
-            s.index = pd.to_datetime(s.index)
-            s = s.sort_index()
+        if 'type' in df.columns:
+            mask = mask | df['type'].astype(str).str.contains(kw, na=False, regex=False)
+        if 'origin_name' in df.columns:
+            mask = mask | df['origin_name'].astype(str).str.contains(kw, na=False, regex=False)
             
-            # 若為損益表(P&L)項目，進行反累加運算以取得「單季」數據
-            if is_pl:
-                s_single = s.copy()
-                for i in range(1, len(s)):
-                    # 若為同一個年度，單季 = 本季累計 - 上一季累計
-                    if s.index[i].year == s.index[i-1].year:
+    if mask.any():
+        s = df[mask].drop_duplicates(subset=['date']).set_index('date')['value']
+        s.index = pd.to_datetime(s.index)
+        s = s.sort_index()
+        
+        # 損益表還原單季 (解決台灣財報的累計問題)
+        if is_pl:
+            s_single = s.copy()
+            for i in range(1, len(s)):
+                if s.index[i].year == s.index[i-1].year:
+                    q_diff = s.index[i].quarter - s.index[i-1].quarter
+                    if q_diff == 1: # 必須是連續兩季才能相減還原
                         s_single.iloc[i] = s.iloc[i] - s.iloc[i-1]
-                return s_single
-            return s
+                    else:
+                        s_single.iloc[i] = np.nan
+            return s_single.dropna()
+        return s
     return pd.Series(dtype='float64')
 
 # -----------------------------------------------------------------------------
@@ -267,7 +279,7 @@ def main():
 
     # 驅動雙引擎
     data_yf, err = fetch_stock_data_yf(ticker)
-    df_fm = fetch_finmind_q_data(ticker_input)
+    df_fm_pl, df_fm_bs = fetch_finmind_q_data(ticker_input) # 分開接收兩張表
 
     if err:
         st.error(f"資料獲取失敗: {err}")
@@ -293,18 +305,21 @@ def main():
     total_assets_ann = get_series(bal_df, ['Total Assets'])
     rev_ann = get_series(fin_df, ['Total Revenue', 'Revenue'])
 
-    # 取出 FinMind 季報數據 (專門突破近 4 季瓶頸)
-    if not df_fm.empty:
-        rev_q = get_fm_series(df_fm, ['營業收入合計', '營業收入', '收益合計', '淨收益']).tail(4)
-        gp_q = get_fm_series(df_fm, ['營業毛利（毛損）', '營業毛利（毛損）淨額', '營業毛利']).tail(4)
-        op_inc_q = get_fm_series(df_fm, ['營業利益（損失）', '營業利益']).tail(4)
-        eps_q = get_fm_series(df_fm, ['基本每股盈餘（元）', '基本每股盈餘']).tail(4)
-        ni_q = get_fm_series(df_fm, ['本期淨利（淨損）', '本期淨利']).tail(4)
-        eq_q = get_fm_series(df_fm, ['權益總額', '權益總計'], is_pl=False).tail(4)
+    # 取出 FinMind 季報數據 (加入精準英文關鍵字確保命中)
+    if not df_fm_pl.empty:
+        rev_q = get_fm_series(df_fm_pl, ['Revenue', '營業收入合計', '營業收入', '收益合計', '淨收益']).tail(4)
+        gp_q = get_fm_series(df_fm_pl, ['GrossProfit', '營業毛利（毛損）', '營業毛利']).tail(4)
+        op_inc_q = get_fm_series(df_fm_pl, ['OperatingIncome', '營業利益（損失）', '營業利益']).tail(4)
+        eps_q = get_fm_series(df_fm_pl, ['EPS', '基本每股盈餘']).tail(4)
+        ni_q = get_fm_series(df_fm_pl, ['NetIncome', '本期淨利（淨損）', '本期淨利']).tail(4)
     else:
-        # 極端情況防呆機制 (若 FinMind API 暫時無回應，給予空值避免崩潰)
-        st.warning("⚠️ 無法獲取 FinMind 季報資料，部分近 4 季指標將暫時無法顯示。")
-        rev_q = gp_q = op_inc_q = eps_q = ni_q = eq_q = pd.Series(dtype='float64')
+        st.warning("⚠️ 無法獲取 FinMind 損益表資料，近 4 季指標將暫時無法顯示。")
+        rev_q = gp_q = op_inc_q = eps_q = ni_q = pd.Series(dtype='float64')
+
+    if not df_fm_bs.empty:
+        eq_q = get_fm_series(df_fm_bs, ['TotalEquity', '權益總額', '權益總計'], is_pl=False).tail(4)
+    else:
+        eq_q = pd.Series(dtype='float64')
 
     cur_price = info.get('currentPrice', 0)
     target_price = info.get('targetMeanPrice', cur_price)
