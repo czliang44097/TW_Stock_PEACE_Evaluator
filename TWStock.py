@@ -510,12 +510,12 @@ def main():
     results.append({'cat': 'P', 'id': 1, 'name': '近4季營收為正、不衰退', 'pass': check_trend_q(rev_q), 'val': '近4季趨勢', 'chart': rev_q})
     results.append({'cat': 'P', 'id': 2, 'name': '近4季毛利率為正、不衰退', 'pass': check_trend_q(gp_q), 'val': '近4季趨勢', 'chart': gp_q})
     results.append({'cat': 'P', 'id': 3, 'name': '近4季營業利益為正、不衰退', 'pass': check_trend_q(op_inc_q), 'val': '近4季趨勢', 'chart': op_inc_q})
-    results.append({'cat': 'P', 'id': 4, 'name': '近4季EPS為正、不衰退', 'pass': check_trend_q(eps_q), 'val': f"最新(Q): {eps_q.values[-1] if not eps_q.empty else 0:.2f}", 'chart': eps_q, 'star': True})
+    results.append({'cat': 'P', 'id': 4, 'name': '近4季(可用資料)EPS為正且不衰退', 'pass': check_trend_q(eps_q), 'val': f"最新(Q): {eps_q.values[-1] if not eps_q.empty else 0:.2f}", 'chart': eps_q, 'star': True})
 
     # <E增長>
     results.append({'cat': 'E', 'id': 5, 'name': '近4季總營收正成長', 'pass': check_growth_q(rev_q), 'val': '近4季成長', 'chart': rev_q})
     results.append({'cat': 'E', 'id': 6, 'name': '近4季營業利益正成長', 'pass': check_growth_q(op_inc_q), 'val': '近4季成長', 'chart': op_inc_q})
-    results.append({'cat': 'E', 'id': 7, 'name': '近4季EPS正成長', 'pass': check_growth_q(eps_q), 'val': '近4季成長', 'chart': eps_q, 'star': True})
+    results.append({'cat': 'E', 'id': 7, 'name': '近4季(可用資料)EPS正成長', 'pass': check_growth_q(eps_q), 'val': '近4季成長', 'chart': eps_q, 'star': True})
 
     # <A現金>
     df_8 = pd.DataFrame({'營運(OCF)': ocf, '自由(FCF)': fcf})
