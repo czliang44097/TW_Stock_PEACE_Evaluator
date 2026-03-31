@@ -370,7 +370,7 @@ def plot_multi_bar(data, title, barmode='group'):
     
     # 若為季報資料，將 index 轉成字串顯示比較好看
     if not df.index.empty and isinstance(df.index[0], pd.Timestamp):
-        df.index = df.index.strftime('%Y-Q%q')
+        df.index = [f"{d.year}-Q{d.quarter}" for d in df.index]
 
     df = df.dropna(how='all')
     df_plot = df.reset_index().melt(id_vars='index')
