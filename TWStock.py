@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 # 1. 頁面設定
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="PEACE 台股品質分析",
+    page_title="PEACE 台股品質分析 (雙引擎版)",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -90,72 +90,107 @@ def inject_custom_css(theme_mode):
     st.markdown(base_css + selected_css + "</style>", unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 3. 輔助函數
+# 3. 雙引擎架構 - 資料獲取
 # -----------------------------------------------------------------------------
 
+# 【引擎 A】YFinance (處理即時股價、VIX、年度大表)
 @st.cache_data(ttl=3600)
-def fetch_sp500_pe():
-    try: return yf.Ticker("SPY").info.get('trailingPE')
-    except: return None
-
-@st.cache_data(ttl=3600)
-def fetch_fear_greed():
+def fetch_stock_data_yf(ticker):
     try:
-        url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-        headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile"}
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-            d = r.json().get('fear_and_greed', {})
-            return {"score": float(d.get('score', 0)), "rating": d.get('rating', 'Neutral')}
-    except: pass
-    return None
-
-def _fetch_realized_vol(ticker, window=21):
-    try:
-        hist = yf.Ticker(ticker).history(period="3mo")
-        if hist.empty: return None
-        hist['Log_Ret'] = np.log(hist['Close'] / hist['Close'].shift(1))
-        hist['Volatility'] = hist['Log_Ret'].rolling(window=window).std() * np.sqrt(252) * 100
-        return hist['Volatility'].dropna().iloc[-1]
-    except: return None
-
-@st.cache_data(ttl=3600)
-def fetch_vix_data():
-    vix_config = {
-        "S&P 500 VIX": {"ticker": "^VIX", "proxy": "SPY"},
-        "Nasdaq VIX": {"ticker": "^VXN", "proxy": "QQQ"},
-        "Semi VIX": {"ticker": "^VXSOX", "proxy": "SMH"}
-    }
-    results = {}
-    for name, cfg in vix_config.items():
+        stock = yf.Ticker(ticker)
+        info = {
+            'symbol': ticker, 'shortName': ticker, 'currency': 'TWD',
+            'currentPrice': 0, 'targetMeanPrice': 0,
+            'longBusinessSummary': '無法獲取詳細簡介',
+            'debtToEquity': None, 'currentRatio': None,
+            'trailingPE': None, 'forwardPE': None, 'pegRatio': None, 
+            'hist_pe_avg': None, 'hist_pe_min': None
+        }
         try:
-            t_obj = yf.Ticker(cfg["ticker"])
-            val = None
-            try: val = t_obj.fast_info.last_price
-            except: pass
-            hist = t_obj.history(period="5y")
-            if val is None and not hist.empty: val = hist['Close'].iloc[-1]
-            
-            if name == "Semi VIX" and (val is None or val <= 0 or hist.empty):
-                calc_vol = _fetch_realized_vol(cfg["proxy"])
-                if calc_vol:
-                    results[name] = {"val": calc_vol, "pr": 50, "is_proxy": True}
-                    continue
-            
-            if val is not None and not hist.empty:
-                pr = (hist['Close'] < val).mean() * 100
-                results[name] = {"val": val, "pr": pr, "is_proxy": False}
-            else: results[name] = None
-        except: results[name] = None
-    return results
+            full = stock.info
+            if full and 'symbol' in full:
+                for k in info.keys():
+                    if k in full: info[k] = full[k]
+        except: pass
 
-def get_vix_status_color(pr, is_proxy=False):
-    if is_proxy: return "#888", "ETF波動率 (估算)"
-    if pr is None: return "#888", "N/A"
-    if pr > 90: return "#ff4d4d", "極度恐慌 (重押)"
-    if pr > 80: return "#f1c40f", "恐慌 (加碼)"
-    if pr < 20: return "#3498db", "貪婪 (減碼)"
-    return "#2ecc71", "正常波動"
+        if info['currentPrice'] == 0:
+            try: info['currentPrice'] = stock.fast_info.last_price
+            except: pass
+
+        def get_combined(annual, mode='sum'):
+            try:
+                ann = annual.T.sort_index()
+                ann = ann[ann.index <= pd.Timestamp.now()].dropna(how='all')
+                if not ann.empty:
+                    ann.index = ann.index.astype(str).str[:4]
+                    return ann
+            except: pass
+            return pd.DataFrame()
+
+        fin = get_combined(stock.financials, 'sum')
+        bal = get_combined(stock.balance_sheet, 'latest')
+        cf = get_combined(stock.cashflow, 'sum')
+        
+        hist_price = pd.DataFrame()
+        try: hist_price = stock.history(period="10y")
+        except: pass
+
+        return {'info': info, 'fin': fin, 'bal': bal, 'cf': cf, 'history': hist_price}, None
+    except Exception as e: return None, f"YFinance API 錯誤: {e}"
+
+# 【引擎 B】FinMind (處理精準台股季報)
+@st.cache_data(ttl=3600)
+def fetch_finmind_q_data(stock_id):
+    # 去除 YF 的 .TW 後綴
+    pure_id = stock_id.replace('.TW', '').replace('.TWO', '')
+    url = "https://api.finmindtrade.com/api/v4/data"
+    start_date = (pd.Timestamp.now() - pd.DateOffset(years=3)).strftime("%Y-%m-%d")
+    
+    params = {
+        "dataset": "TaiwanStockFinancialStatements",
+        "data_id": pure_id,
+        "start_date": start_date
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        if data.get('msg') == 'success' and data.get('data'):
+            return pd.DataFrame(data['data'])
+    except: pass
+    return pd.DataFrame()
+
+# FinMind 季報還原器 (處理累計值問題)
+def get_fm_series(df, keywords, is_pl=True):
+    if df.empty: return pd.Series(dtype='float64')
+    for kw in keywords:
+        mask = df['type'].str.contains(kw, na=False, regex=False)
+        if mask.any():
+            s = df[mask].drop_duplicates(subset=['date']).set_index('date')['value']
+            s.index = pd.to_datetime(s.index)
+            s = s.sort_index()
+            
+            # 若為損益表(P&L)項目，進行反累加運算以取得「單季」數據
+            if is_pl:
+                s_single = s.copy()
+                for i in range(1, len(s)):
+                    # 若為同一個年度，單季 = 本季累計 - 上一季累計
+                    if s.index[i].year == s.index[i-1].year:
+                        s_single.iloc[i] = s.iloc[i] - s.iloc[i-1]
+                return s_single
+            return s
+    return pd.Series(dtype='float64')
+
+# -----------------------------------------------------------------------------
+# 4. 輔助工具 (恐慌指數、策略計算)
+# -----------------------------------------------------------------------------
+def get_series(df, keywords):
+    if df is None or df.empty: return pd.Series(dtype='float64')
+    for k in keywords:
+        if k in df.columns: return df[k]
+    for c in df.columns:
+        for k in keywords:
+            if k.lower() in str(c).lower(): return df[c]
+    return pd.Series(dtype='float64', index=df.index)
 
 def calculate_strategy(history_df):
     try:
@@ -182,174 +217,6 @@ def calculate_strategy(history_df):
         return sig
     except: return None
 
-@st.cache_data(ttl=3600)
-def scrape_yahoo_valuation(ticker):
-    url = f"https://finance.yahoo.com/quote/{ticker}/key-statistics"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    
-    result = {'trailingPE': None, 'forwardPE': None, 'pegRatio': None, 'hist_pe_avg': None, 'hist_pe_min': None}
-    
-    def extract_float(s):
-        try:
-            s = str(s).replace(',', '').strip()
-            if s in ['N/A', '-', 'nan']: return None
-            mult = 1
-            if s.upper().endswith('T'): mult = 1e12; s=s[:-1]
-            elif s.upper().endswith('B'): mult = 1e9; s=s[:-1]
-            elif s.upper().endswith('M'): mult = 1e6; s=s[:-1]
-            return float(s) * mult
-        except: return None
-
-    try:
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code != 200: return result
-
-        dfs = pd.read_html(r.text)
-        target_df = None
-        for df in dfs:
-            if df.shape[1] > 1 and df.iloc[:, 0].astype(str).str.lower().str.contains("trailing p/e").any():
-                target_df = df
-                break
-        
-        if target_df is not None:
-            for idx, row in target_df.iterrows():
-                label = str(row.iloc[0]).lower()
-                if "trailing p/e" in label:
-                    result['trailingPE'] = extract_float(row.iloc[1])
-                    hist_vals = []
-                    for c in range(2, 7):
-                        if c < len(row):
-                            v = extract_float(row.iloc[c])
-                            if v and v > 0: hist_vals.append(v)
-                    if hist_vals:
-                        result['hist_pe_avg'] = np.mean(hist_vals)
-                        result['hist_pe_min'] = np.min(hist_vals)
-                elif "forward p/e" in label:
-                    result['forwardPE'] = extract_float(row.iloc[1])
-                elif "peg ratio" in label:
-                    result['pegRatio'] = extract_float(row.iloc[1])
-        return result
-    except:
-        return result
-
-def format_large_num(num):
-    if num is None or np.isnan(num): return "0"
-    if abs(num) >= 1e9: return f"{num/1e9:.2f}B"
-    elif abs(num) >= 1e6: return f"{num/1e6:.2f}M"
-    return f"{num:,.0f}"
-
-# -----------------------------------------------------------------------------
-# 4. 數據獲取 (核心 - 含備援機制)
-# -----------------------------------------------------------------------------
-@st.cache_data(ttl=3600)
-def fetch_stock_data(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        
-        info = {
-            'symbol': ticker, 'shortName': ticker, 'currency': 'TWD',
-            'currentPrice': 0, 'targetMeanPrice': 0,
-            'longBusinessSummary': '無法獲取詳細簡介',
-            'debtToEquity': None, 'currentRatio': None,
-            'trailingPE': None, 'forwardPE': None, 'pegRatio': None, 
-            'earningsGrowth': None,
-            'hist_pe_avg': None, 'hist_pe_min': None, 'beta': None,
-            'pe_source': None, 'peg_source': None, 'hist_source': None
-        }
-        
-        try:
-            full = stock.info
-            if full and 'symbol' in full:
-                for k in info.keys():
-                    if k in full: info[k] = full[k]
-                for k in ['trailingPegRatio', 'targetMeanPrice']:
-                    if k in full: info[k] = full[k]
-        except: pass
-
-        if info['currentPrice'] == 0:
-            try:
-                f = stock.fast_info
-                if f: info['currentPrice'], info['currency'] = f.last_price, f.currency
-            except: pass
-
-        scraped = scrape_yahoo_valuation(ticker)
-        if scraped['trailingPE']: 
-            info['trailingPE'] = scraped['trailingPE']
-            info['pe_source'] = 'Scraped'
-        if scraped['forwardPE']:
-            info['forwardPE'] = scraped['forwardPE']
-        if scraped['pegRatio']:
-            info['pegRatio'] = scraped['pegRatio']
-            info['peg_source'] = 'Scraped'
-        elif info.get('trailingPegRatio'):
-            info['pegRatio'] = info.get('trailingPegRatio')
-        if scraped['hist_pe_avg']:
-            info['hist_pe_avg'] = scraped['hist_pe_avg']
-            info['hist_source'] = 'Scraped (Table)'
-        if scraped['hist_pe_min']:
-            info['hist_pe_min'] = scraped['hist_pe_min']
-
-        def get_combined(annual, quarterly, mode='sum'):
-            try:
-                ann = annual.T.sort_index()
-                ann = ann[ann.index <= pd.Timestamp.now()].dropna(how='all')
-            except: ann = pd.DataFrame()
-            try:
-                qrt = quarterly
-                if qrt is not None and not qrt.empty:
-                    q_sort = qrt.T.sort_index()
-                    rec = q_sort.tail(4)
-                    if not rec.empty:
-                        val = rec.sum(axis=0, min_count=1) if mode == 'sum' else rec.iloc[-1]
-                        df_ttm = pd.DataFrame(val).T
-                        df_ttm.index = ["TTM"]
-                        ann_str = ann.copy()
-                        ann_str.index = ann_str.index.astype(str).str[:4]
-                        return pd.concat([ann_str, df_ttm])
-            except: pass
-            if not ann.empty:
-                ann.index = ann.index.astype(str).str[:4]
-                return ann
-            return pd.DataFrame()
-
-        try:
-            # 獲取年度資料 + TTM
-            fin = get_combined(stock.financials, stock.quarterly_financials, 'sum')
-            bal = get_combined(stock.balance_sheet, stock.quarterly_balance_sheet, 'latest')
-            cf = get_combined(stock.cashflow, stock.quarterly_cashflow, 'sum')
-            
-            # 獲取純季報資料 (供近4季運算使用)
-            fin_q = stock.quarterly_financials
-            bal_q = stock.quarterly_balance_sheet
-            cf_q = stock.quarterly_cashflow
-            
-            hist_price = pd.DataFrame()
-            try: hist_price = stock.history(period="10y")
-            except: pass
-
-            if info['trailingPE'] is None:
-                eps_col = next((c for c in fin.columns if 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)), None)
-                if eps_col:
-                    try:
-                        e_ttm = fin.loc["TTM", eps_col]
-                        if e_ttm > 0: info['trailingPE'] = info['currentPrice'] / e_ttm
-                    except: pass
-
-            return {
-                'info': info, 'fin': fin, 'bal': bal, 'cf': cf, 'history': hist_price,
-                'fin_q': fin_q, 'bal_q': bal_q, 'cf_q': cf_q
-            }, None
-
-        except Exception as e: return None, f"數據處理錯誤: {e}"
-    except Exception as e: return None, f"API 連線錯誤: {e}"
-
-# -----------------------------------------------------------------------------
-# 5. 繪圖與 HTML
-# -----------------------------------------------------------------------------
 def plot_gauge(cur, fair):
     if not fair or fair == 0: fair = cur
     fig = go.Figure(go.Indicator(
@@ -368,7 +235,6 @@ def plot_multi_bar(data, title, barmode='group'):
     if data is None or ((isinstance(data, pd.DataFrame) or isinstance(data, pd.Series)) and data.empty): return None
     df = data.to_frame(name='Value') if isinstance(data, pd.Series) else data.copy()
     
-    # 若為季報資料，將 index 轉成字串顯示比較好看
     if not df.index.empty and isinstance(df.index[0], pd.Timestamp):
         df.index = [f"{d.year}-Q{d.quarter}" for d in df.index]
 
@@ -379,80 +245,66 @@ def plot_multi_bar(data, title, barmode='group'):
     fig.update_traces(textposition='outside')
     return fig
 
-def get_series(df, keywords):
-    if df is None or df.empty: return pd.Series(dtype='float64')
-    for k in keywords:
-        if k in df.columns: return df[k]
-    for c in df.columns:
-        for k in keywords:
-            if k.lower() in str(c).lower(): return df[c]
-    return pd.Series(dtype='float64', index=df.index)
-
 # -----------------------------------------------------------------------------
-# 6. 主程式 (啟動)
+# 5. 主程式 (啟動)
 # -----------------------------------------------------------------------------
 def main():
     with st.sidebar:
         st.header("🔍 台股搜尋")
-        # 前台只需要輸入數字代碼
         ticker_input = st.text_input("輸入台股代碼 (例如: 2330)", "2330").strip().upper()
         
-        # 新增日夜模式切換
         st.markdown("---")
-        mode = st.toggle("🌙 夜間模式", value=False) # False=Light, True=Dark
+        mode = st.toggle("🌙 夜間模式", value=False)
         theme_mode = 'dark' if mode else 'light'
         inject_custom_css(theme_mode)
 
     if not ticker_input: return
     
-    # 後台自動補上 .TW (若使用者已打 .TW 或 .TWO 則不補)
     if not ticker_input.endswith(".TW") and not ticker_input.endswith(".TWO"):
         ticker = f"{ticker_input}.TW"
     else:
         ticker = ticker_input
 
-    data, err = fetch_stock_data(ticker)
-    fg_data = fetch_fear_greed()
-    vix_data = fetch_vix_data()
-    sp500_pe = fetch_sp500_pe()
+    # 驅動雙引擎
+    data_yf, err = fetch_stock_data_yf(ticker)
+    df_fm = fetch_finmind_q_data(ticker_input)
 
     if err:
         st.error(f"資料獲取失敗: {err}")
         return
 
-    info = data['info']
-    fin_df, bal_df, cf_df = data['fin'], data['bal'], data['cf']
-    hist_price = data['history']
-    
-    # 季報轉置並排序
-    fin_q = data['fin_q'].T.sort_index() if data['fin_q'] is not None and not data['fin_q'].empty else pd.DataFrame()
-    bal_q = data['bal_q'].T.sort_index() if data['bal_q'] is not None and not data['bal_q'].empty else pd.DataFrame()
-    cf_q = data['cf_q'].T.sort_index() if data['cf_q'] is not None and not data['cf_q'].empty else pd.DataFrame()
-
+    info = data_yf['info']
+    fin_df, bal_df, cf_df = data_yf['fin'], data_yf['bal'], data_yf['cf']
+    hist_price = data_yf['history']
     strategy_signal = calculate_strategy(hist_price)
 
-    # 提取年度與 TTM 數據 (給部分原有邏輯使用)
-    rev = get_series(fin_df, ['Total Revenue', 'Revenue'])
-    op_inc = get_series(fin_df, ['Operating Income', 'EBIT'])
-    net_inc = get_series(fin_df, ['Net Income'])
-    ocf = get_series(cf_df, ['Operating Cash Flow'])
-    icf = get_series(cf_df, ['Investing Cash Flow'])
-    financing_cf = get_series(cf_df, ['Financing Cash Flow'])
-    fcf = get_series(cf_df, ['Free Cash Flow'])
-    if (fcf.sum() == 0) and not ocf.empty:
+    # 取出 YF 年度數據 (給不依賴季報的指標使用)
+    op_inc_ann = get_series(fin_df, ['Operating Income', 'EBIT'])
+    net_inc_ann = get_series(fin_df, ['Net Income'])
+    ocf_ann = get_series(cf_df, ['Operating Cash Flow'])
+    icf_ann = get_series(cf_df, ['Investing Cash Flow'])
+    financing_cf_ann = get_series(cf_df, ['Financing Cash Flow'])
+    fcf_ann = get_series(cf_df, ['Free Cash Flow'])
+    if (fcf_ann.sum() == 0) and not ocf_ann.empty:
         capex = get_series(cf_df, ['Capital Expenditure'])
-        fcf = ocf + capex
-    equity = get_series(bal_df, ['Stockholders Equity', 'Total Stockholder Equity'])
-    total_debt = get_series(bal_df, ['Total Debt'])
-    total_assets = get_series(bal_df, ['Total Assets'])
+        fcf_ann = ocf_ann + capex
+    equity_ann = get_series(bal_df, ['Stockholders Equity', 'Total Stockholder Equity'])
+    total_debt_ann = get_series(bal_df, ['Total Debt'])
+    total_assets_ann = get_series(bal_df, ['Total Assets'])
+    rev_ann = get_series(fin_df, ['Total Revenue', 'Revenue'])
 
-    # 提取近 4 季數據
-    rev_q = get_series(fin_q, ['Total Revenue', 'Revenue']).tail(4)
-    gp_q = get_series(fin_q, ['Gross Profit']).tail(4)
-    op_inc_q = get_series(fin_q, ['Operating Income', 'EBIT']).tail(4)
-    eps_q = get_series(fin_q, ['Diluted EPS', 'Basic EPS']).tail(4)
-    ni_q = get_series(fin_q, ['Net Income']).tail(4)
-    eq_q = get_series(bal_q, ['Stockholders Equity', 'Total Stockholder Equity']).tail(4)
+    # 取出 FinMind 季報數據 (專門突破近 4 季瓶頸)
+    if not df_fm.empty:
+        rev_q = get_fm_series(df_fm, ['營業收入合計', '營業收入', '收益合計', '淨收益']).tail(4)
+        gp_q = get_fm_series(df_fm, ['營業毛利（毛損）', '營業毛利（毛損）淨額', '營業毛利']).tail(4)
+        op_inc_q = get_fm_series(df_fm, ['營業利益（損失）', '營業利益']).tail(4)
+        eps_q = get_fm_series(df_fm, ['基本每股盈餘（元）', '基本每股盈餘']).tail(4)
+        ni_q = get_fm_series(df_fm, ['本期淨利（淨損）', '本期淨利']).tail(4)
+        eq_q = get_fm_series(df_fm, ['權益總額', '權益總計'], is_pl=False).tail(4)
+    else:
+        # 極端情況防呆機制 (若 FinMind API 暫時無回應，給予空值避免崩潰)
+        st.warning("⚠️ 無法獲取 FinMind 季報資料，部分近 4 季指標將暫時無法顯示。")
+        rev_q = gp_q = op_inc_q = eps_q = ni_q = eq_q = pd.Series(dtype='float64')
 
     cur_price = info.get('currentPrice', 0)
     target_price = info.get('targetMeanPrice', cur_price)
@@ -463,7 +315,6 @@ def main():
     with col1:
         st.title(f"{info.get('shortName', ticker)}")
         st.markdown(f"### {info.get('currency', 'TWD')} {cur_price}")
-        st.caption(info.get('longBusinessSummary', '')[:150] + '...')
         
         st.markdown("#### 📊 估值指標")
         def fmt_val(val, suffix='x'): return f"{val:.2f}{suffix}" if val and val > 0 else "-"
@@ -489,64 +340,58 @@ def main():
 
     results = []
     
-    # 趨勢檢驗：年度
+    # 趨勢檢驗
     def get_annual_only(series): return series[series.index != "TTM"].dropna()
-    def check_trend(series):
+    def check_trend_annual(series):
         s = get_annual_only(series)
         if len(s) < 2: return False
         return all(v > 0 for v in s.values) and (s.values[-1] >= s.values[0] * 0.95)
     
-    # 趨勢檢驗：季報
     def check_trend_q(series):
         if series is None or len(series) < 2: return False
         return all(v > 0 for v in series.values) and (series.values[-1] >= series.values[0] * 0.95)
     
-    # 成長檢驗：季報
     def check_growth_q(series):
         if series is None or len(series) < 2: return False
         return ((series.values[-1] - series.values[0]) / abs(series.values[0])) > 0
+
+    # 確保預防空值崩潰
+    latest_eps_q = eps_q.values[-1] if not eps_q.empty else 0
 
     # <P營利>
     results.append({'cat': 'P', 'id': 1, 'name': '近4季營收為正、不衰退', 'pass': check_trend_q(rev_q), 'val': '近4季趨勢', 'chart': rev_q})
     results.append({'cat': 'P', 'id': 2, 'name': '近4季毛利率為正、不衰退', 'pass': check_trend_q(gp_q), 'val': '近4季趨勢', 'chart': gp_q})
     results.append({'cat': 'P', 'id': 3, 'name': '近4季營業利益為正、不衰退', 'pass': check_trend_q(op_inc_q), 'val': '近4季趨勢', 'chart': op_inc_q})
-    results.append({'cat': 'P', 'id': 4, 'name': '近4季(可用資料)EPS為正且不衰退', 'pass': check_trend_q(eps_q), 'val': f"最新(Q): {eps_q.values[-1] if not eps_q.empty else 0:.2f}", 'chart': eps_q, 'star': True})
+    results.append({'cat': 'P', 'id': 4, 'name': '近4季EPS為正、不衰退', 'pass': check_trend_q(eps_q), 'val': f"最新(Q): {latest_eps_q:.2f}", 'chart': eps_q, 'star': True})
 
     # <E增長>
     results.append({'cat': 'E', 'id': 5, 'name': '近4季總營收正成長', 'pass': check_growth_q(rev_q), 'val': '近4季成長', 'chart': rev_q})
     results.append({'cat': 'E', 'id': 6, 'name': '近4季營業利益正成長', 'pass': check_growth_q(op_inc_q), 'val': '近4季成長', 'chart': op_inc_q})
-    results.append({'cat': 'E', 'id': 7, 'name': '近4季(可用資料)EPS正成長', 'pass': check_growth_q(eps_q), 'val': '近4季成長', 'chart': eps_q, 'star': True})
+    results.append({'cat': 'E', 'id': 7, 'name': '近4季EPS正成長', 'pass': check_growth_q(eps_q), 'val': '近4季成長', 'chart': eps_q, 'star': True})
 
-    # <A現金>
-    df_8 = pd.DataFrame({'營運(OCF)': ocf, '自由(FCF)': fcf})
-    pass_8 = check_trend(ocf) and check_trend(fcf)
+    # <A現金> (使用 YFinance 年度)
+    df_8 = pd.DataFrame({'營運(OCF)': ocf_ann, '自由(FCF)': fcf_ann})
+    pass_8 = check_trend_annual(ocf_ann) and check_trend_annual(fcf_ann)
     results.append({'cat': 'A', 'id': 8, 'name': '營運現金流、自由現金流持續增加且皆為正', 'pass': pass_8, 'val': '雙現金流對比', 'chart': df_8, 'mode': 'group', 'star': True})
     
-    df_9 = pd.DataFrame({'營運(OCF)': ocf, '投資(ICF)': icf, '融資(FinCF)': financing_cf})
-    ocf_ann = get_annual_only(ocf)
-    icf_ann = get_annual_only(icf)
-    fin_ann = get_annual_only(financing_cf)
-    common_idx = ocf_ann.index.intersection(icf_ann.index).intersection(fin_ann.index)
+    df_9 = pd.DataFrame({'營運(OCF)': ocf_ann, '投資(ICF)': icf_ann, '融資(FinCF)': financing_cf_ann})
+    ocf_a = get_annual_only(ocf_ann)
+    icf_a = get_annual_only(icf_ann)
+    fin_a = get_annual_only(financing_cf_ann)
+    common_idx = ocf_a.index.intersection(icf_a.index).intersection(fin_a.index)
     pass_9 = False
-    if len(common_idx) > 0: pass_9 = all(ocf_ann[common_idx] > (icf_ann[common_idx].abs() + fin_ann[common_idx].abs()))
+    if len(common_idx) > 0: pass_9 = all(ocf_a[common_idx] > (icf_a[common_idx].abs() + fin_a[common_idx].abs()))
     results.append({'cat': 'A', 'id': 9, 'name': '營運現金流 > 融資、投資現金流', 'pass': pass_9, 'val': '三流並列', 'chart': df_9, 'mode': 'group', 'star': True})
     
-    ratio_q_ttm = ocf.values[-1] / net_inc.values[-1] if not net_inc.empty and net_inc.values[-1] != 0 else 0
+    ratio_q_ttm = ocf_ann.values[-1] / net_inc_ann.values[-1] if not net_inc_ann.empty and net_inc_ann.values[-1] != 0 else 0
     pass_10 = ratio_q_ttm > 0.8
-    cash_quality_series = (ocf / net_inc).replace([np.inf, -np.inf], 0).fillna(0)
-    results.append({'cat': 'A', 'id': 10, 'name': '收益質量(營運現金流/淨利) > 0.8', 'pass': pass_10, 'val': f"最新(TTM): {ratio_q_ttm:.2f}", 'chart': cash_quality_series, 'star': True})
+    cash_quality_series = (ocf_ann / net_inc_ann).replace([np.inf, -np.inf], 0).fillna(0)
+    results.append({'cat': 'A', 'id': 10, 'name': '收益質量(營運現金流/淨利) > 0.8', 'pass': pass_10, 'val': f"最新(Y): {ratio_q_ttm:.2f}", 'chart': cash_quality_series, 'star': True})
 
     # <C保守與安全性>
-    de_ratio = 0
-    de_source = "manual"
-    if not total_debt.empty and not equity.empty:
-        try: de_ratio = total_debt.values[-1] / equity.values[-1]
-        except: de_source = "api"
-    else: de_source = "api"
-    if de_source == "api":
-        de_ratio = info.get('debtToEquity')
-        if de_ratio is None: de_ratio = 0
-        else: de_ratio = de_ratio / 100 
+    de_ratio = info.get('debtToEquity')
+    if de_ratio is None: de_ratio = 0
+    else: de_ratio = de_ratio / 100 
 
     curr_ratio = info.get('currentRatio')
     if curr_ratio is None or curr_ratio == 0:
@@ -567,29 +412,28 @@ def main():
     val_12 = f"CR: {curr_ratio:.2f}" if curr_ratio is not None else "CR: N/A"
     results.append({'cat': 'C', 'id': 12, 'name': '流動比率 > 100%', 'pass': pass_12, 'val': val_12, 'chart': None})
     
-    debt_years = (total_debt.values[-1] / net_inc.values[-1]) if (not total_debt.empty and not net_inc.empty and net_inc.values[-1] > 0) else 99
+    debt_years = (total_debt_ann.values[-1] / net_inc_ann.values[-1]) if (not total_debt_ann.empty and not net_inc_ann.empty and net_inc_ann.values[-1] > 0) else 99
     results.append({'cat': 'C', 'id': 13, 'name': '長期負債/淨利 < 4', 'pass': debt_years < 4, 'val': f"{debt_years:.1f}", 'chart': None})
     
     # <E效率與經營能力>
     try:
         if not ni_q.empty and not eq_q.empty and eq_q.values[-1] > 0:
-            # 近4季淨利總和 / 最新一季股東權益
             roe_4q = (ni_q.sum() / eq_q.values[-1]) * 100
         else:
             roe_4q = 0
     except: roe_4q = 0
     results.append({'cat': 'E_EFF', 'id': 14, 'name': '近4季 ROE > 15%', 'pass': roe_4q > 15, 'val': f"{roe_4q:.1f}%", 'chart': None, 'star': True})
     
-    ato = (rev.values[-1] / total_assets.values[-1]) if not total_assets.empty and total_assets.values[-1] > 0 else 0
+    ato = (rev_ann.values[-1] / total_assets_ann.values[-1]) if not total_assets_ann.empty and total_assets_ann.values[-1] > 0 else 0
     results.append({'cat': 'E_EFF', 'id': 15, 'name': '總資產週轉率 > 0.7', 'pass': ato > 0.7, 'val': f"{ato:.2f}", 'chart': None})
     
     try:
-        tax_rate = 0.20 # 台股預設營所稅率20%
-        latest_equity = equity.values[-1] if not equity.empty else 0
-        latest_debt = total_debt.values[-1] if not total_debt.empty else 0
+        tax_rate = 0.20
+        latest_equity = equity_ann.values[-1] if not equity_ann.empty else 0
+        latest_debt = total_debt_ann.values[-1] if not total_debt_ann.empty else 0
         invested_capital = latest_equity + latest_debt
-        if invested_capital > 0 and not op_inc.empty:
-            roic = (op_inc.values[-1] * (1 - tax_rate)) / invested_capital
+        if invested_capital > 0 and not op_inc_ann.empty:
+            roic = (op_inc_ann.values[-1] * (1 - tax_rate)) / invested_capital
         else: roic = 0
     except: roic = 0
 
