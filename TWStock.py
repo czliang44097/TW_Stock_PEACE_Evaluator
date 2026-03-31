@@ -461,7 +461,9 @@ def main():
                 if item.get('extra'): label_prefix = "➕ "
                 st.markdown(f'<div class="check-item"><div><div class="check-label">{label_prefix}{item["id"]}. {item["name"]}</div><div class="check-sub">{item["val"]}</div></div><div class="{status}">{icon}</div></div>', unsafe_allow_html=True)
                 if item['chart'] is not None:
-                    st.plotly_chart(plot_multi_bar(item['chart'], "", item.get('mode', 'group')), use_container_width=True, key=f"ch_{item['id']}")
+                    fig = plot_multi_bar(item['chart'], "", item.get('mode', 'group'))
+                    if fig is not None: # 多加這一道防線，確保真的有產出圖表才畫出來
+                        st.plotly_chart(fig, use_container_width=True, key=f"ch_{item['id']}")
             st.markdown('</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
